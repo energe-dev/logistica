@@ -668,6 +668,12 @@
       <div class="orders-title">
         <i class="ti ti-list" aria-hidden="true" style="font-size:14px;vertical-align:-2px;margin-right:6px"></i>Órdenes
       </div>
+      <div class="orders-controls">
+        <label for="wh-fil-usuario" style="font-size:10px;color:var(--text-muted);font-weight:700;letter-spacing:.8px;text-transform:uppercase;margin-right:8px">Usuario</label>
+        <select id="wh-fil-usuario" onchange="renderWarehouseView()" style="min-width:150px;padding:6px 9px;border:1px solid var(--border);border-radius:8px;background:var(--white);color:var(--text);font-size:12px;">
+          <option value="">Todos los usuarios</option>
+        </select>
+      </div>
     </div>
     <div class="tbl-wrap">
       <table>
@@ -677,7 +683,7 @@
             <th style="width:55px">Tipo</th>
             <th style="width:160px">Producto</th>
             <th style="width:70px;text-align:right">Cant.</th>
-            <th style="width:90px;text-align:right">Valor USD</th>
+            <th style="width:90px;text-align:right">Valor</th>
             <th style="width:85px">Estado</th>
             <th style="width:80px">Fecha</th>
           </tr>
@@ -1132,6 +1138,7 @@ let _currencies    = {};   // { 'ARS': { symbol, rate }, 'USD': { symbol, rate }
 let _selectedCurr  = null; // set after loading from Odoo
 let _rawAmounts    = { inA: 0, outA: 0 }; // stored in base currency for re-conversion
 let _top5Data      = null; // { topIn, topOut } — cached for currency re-render
+let _liveWarehouse = { inPickings: [], outPickings: [], moves: [], productInfo: {} };
 
 /* ================================================================
    DEMO DATA
@@ -1216,9 +1223,36 @@ async function fetchPickings(typeCode, from, to, filters, limit = 200) {
     ...buildStatusDomain(filters),
   ];
   return odooCall('stock.picking', 'search_read', [domain], {
-    fields: ['name','partner_id','scheduled_date','state','move_ids_without_package'],
+    fields: ['name','partner_id','scheduled_date','state','move_ids_without_package','user_id'],
     limit,
     order: 'scheduled_date desc',
+  });
+}
+
+function getWarehouseUserFilter() {
+  return document.getElementById('wh-fil-usuario')?.value || '';
+}
+
+function getWarehouseUsers(pickings) {
+  return [...new Set(pickings
+    .map(p => Array.isArray(p.user_id) ? p.user_id[1] : p.user_id)
+    .filter(Boolean))].sort();
+}
+
+function populateWarehouseUsers(pickings) {
+  const users = getWarehouseUsers(pickings);
+  const sel = document.getElementById('wh-fil-usuario');
+  if (!sel) return;
+  const first = sel.options[0]?.outerHTML || '<option value="">Todos los usuarios</option>';
+  sel.innerHTML = first + users.map(u => `<option value="${u}">${u}</option>`).join('');
+}
+
+function filterWarehousePickings(pickings) {
+  const user = getWarehouseUserFilter();
+  if (!user) return pickings;
+  return pickings.filter(p => {
+    const name = Array.isArray(p.user_id) ? p.user_id[1] : p.user_id;
+    return name && name.toLowerCase().includes(user.toLowerCase());
   });
 }
 
@@ -1266,7 +1300,7 @@ async function loadCurrencies() {
   const [companies, currRows] = await Promise.all([
     odooCall('res.company', 'search_read', [[]], { fields: ['currency_id'], limit: 1 }),
     odooCall('res.currency', 'search_read',
-      [[['active', '=', true], ['name', 'in', ['ARS', 'USD']]]],
+      [[['active', '=', true]]],
       { fields: ['name', 'symbol', 'rate'] }),
   ]);
 
@@ -1277,6 +1311,12 @@ async function loadCurrencies() {
   _currencies = {};
   for (const c of currRows) {
     _currencies[c.name] = { symbol: c.symbol, rate: c.rate };
+  }
+
+  if (!_currencies[_baseCurrency.name]) {
+    _currencies[_baseCurrency.name] = { symbol: _baseCurrency.symbol || '$', rate: 1 };
+  } else if (!_baseCurrency.symbol) {
+    _baseCurrency.symbol = _currencies[_baseCurrency.name].symbol || _baseCurrency.symbol;
   }
 
   // Default selected = base currency
@@ -1318,8 +1358,15 @@ function setCurrency(name, btn) {
   _selectedCurr = name;
   document.querySelectorAll('.curr-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
-  // Reconvert without re-fetching
-  redisplayAmounts();
+  if (_liveWarehouse.inPickings.length || _liveWarehouse.outPickings.length) {
+    renderWarehouseView();
+  } else {
+    redisplayAmounts();
+    if (_top5Data) {
+      renderTop5('top5-in-body',  _top5Data.topIn,  'in-col');
+      renderTop5('top5-out-body', _top5Data.topOut, 'out-col');
+    }
+  }
 }
 
 function convertAmt(valueInBase) {
@@ -1390,56 +1437,69 @@ async function loadOdooData() {
     const productIds  = [...new Set(moves.map(m => m.product_id[0]))];
     const productInfo = await fetchProductInfo(productIds);
 
-
-    const inIds = new Set(inPickings.map(p => p.id));
-
-    let inQtyTotal = 0, inAmtTotal = 0;
-    let outQtyTotal = 0, outAmtTotal = 0;
-    const orders = [];
-
-    for (const m of moves) {
-      const pickId = m.picking_id[0];
-      const isIn   = inIds.has(pickId);
-      const qty    = m.product_qty || 0;
-      const unit   = m.price_unit || productInfo[m.product_id[0]]?.cost || 0;
-      const val    = qty * unit;
-
-      if (isIn) { inQtyTotal += qty; inAmtTotal += val; }
-      else       { outQtyTotal += qty; outAmtTotal += val; }
-    }
-
-    // Build order rows from pickings
-    for (const p of [...inPickings, ...outPickings].slice(0, 50)) {
-      const isIn    = inIds.has(p.id);
-      const pMoves  = moves.filter(m => m.picking_id[0] === p.id);
-      const qty     = pMoves.reduce((s,m) => s + (m.product_qty||0), 0);
-      const val     = pMoves.reduce((s,m) => {
-        const unit = m.price_unit || productInfo[m.product_id[0]]?.cost || 0;
-        return s + (m.product_qty||0) * unit;
-      }, 0);
-      orders.push({
-        ref:     p.name,
-        type:    isIn ? 'IN' : 'OUT',
-        product: pMoves[0]?.product_id[1] || '—',
-        qty:     Math.round(qty),
-        val:     Math.round(val),
-        status:  p.state === 'done' ? 'done' : p.state === 'assigned' ? 'confirmed' : 'draft',
-        date:    p.scheduled_date ? p.scheduled_date.slice(0,10) : '—',
-      });
-    }
-
-    updateKPIsRaw(inQtyTotal, inAmtTotal, outQtyTotal, outAmtTotal, orders, inPickings.length, outPickings.length);
-    renderOrders(orders);
-    window._liveOrders = orders;
-    document.getElementById('data-mode').textContent = 'Live · Odoo';
-    updateCharts(buildLiveChartData(inPickings, outPickings, moves, productInfo, from, to));
-    updatePieCharts(inPickings, outPickings, moves, productInfo);
+    _liveWarehouse = { inPickings, outPickings, moves, productInfo };
     await loadCurrencies();
-    updateTop5(inPickings, outPickings, moves, productInfo);
+    populateWarehouseUsers([...inPickings, ...outPickings]);
+    document.getElementById('data-mode').textContent = 'Live · Odoo';
+    renderWarehouseView();
 
   } catch (err) {
     throw err;
   }
+}
+
+function buildWarehouseOrders(inPickings, outPickings, moves, productInfo) {
+  const inIds = new Set(inPickings.map(p => p.id));
+  return [...inPickings, ...outPickings].slice(0, 50).map(p => {
+    const isIn   = inIds.has(p.id);
+    const pMoves = moves.filter(m => m.picking_id[0] === p.id);
+    const qty    = pMoves.reduce((s,m) => s + (m.product_qty||0), 0);
+    const val    = pMoves.reduce((s,m) => {
+      const unit = m.price_unit || productInfo[m.product_id[0]]?.cost || 0;
+      return s + (m.product_qty||0) * unit;
+    }, 0);
+    return {
+      ref:     p.name,
+      type:    isIn ? 'IN' : 'OUT',
+      product: pMoves[0]?.product_id[1] || '—',
+      qty:     Math.round(qty),
+      val:     Math.round(val),
+      status:  p.state === 'done' ? 'done' : p.state === 'assigned' ? 'confirmed' : 'draft',
+      date:    p.scheduled_date ? p.scheduled_date.slice(0,10) : '—',
+      user:    Array.isArray(p.user_id) ? p.user_id[1] : p.user_id || '—',
+    };
+  });
+}
+
+function renderWarehouseView() {
+  const inPickings  = filterWarehousePickings(_liveWarehouse.inPickings);
+  const outPickings = filterWarehousePickings(_liveWarehouse.outPickings);
+  const pickIds     = new Set([...inPickings, ...outPickings].map(p => p.id));
+  const moves       = _liveWarehouse.moves.filter(m => pickIds.has(m.picking_id[0]));
+  const productInfo = _liveWarehouse.productInfo;
+
+  let inQtyTotal = 0, inAmtTotal = 0;
+  let outQtyTotal = 0, outAmtTotal = 0;
+
+  for (const m of moves) {
+    const pickId = m.picking_id[0];
+    const isIn   = inPickings.some(p => p.id === pickId);
+    const qty    = m.product_qty || 0;
+    const unit   = m.price_unit || productInfo[m.product_id[0]]?.cost || 0;
+    const val    = qty * unit;
+    if (isIn) { inQtyTotal += qty; inAmtTotal += val; }
+    else       { outQtyTotal += qty; outAmtTotal += val; }
+  }
+
+  const orders = buildWarehouseOrders(inPickings, outPickings, moves, productInfo);
+  updateKPIsRaw(inQtyTotal, inAmtTotal, outQtyTotal, outAmtTotal, orders, inPickings.length, outPickings.length);
+  renderOrders(orders);
+  window._liveOrders = orders;
+  updateCharts(buildLiveChartData(inPickings, outPickings, moves, productInfo,
+    document.getElementById('date-from').value,
+    document.getElementById('date-to').value));
+  updatePieCharts(inPickings, outPickings, moves, productInfo);
+  updateTop5(inPickings, outPickings, moves, productInfo);
 }
 
 function fmtQ(n) { return Math.round(n).toLocaleString('es') + ' u.'; }
@@ -1621,13 +1681,13 @@ function buildLiveChartData(inPickings, outPickings, moves, productInfo, from, t
     const idx = getIdx(p.scheduled_date);
     if (idx < 0 || idx >= n) continue;
     const t = totals[p.id] || { qty: 0, val: 0 };
-    inQ[idx] += t.qty; inA[idx] += t.val;
+    inQ[idx] += t.qty; inA[idx] += convertAmt(t.val);
   }
   for (const p of outPickings) {
     const idx = getIdx(p.scheduled_date);
     if (idx < 0 || idx >= n) continue;
     const t = totals[p.id] || { qty: 0, val: 0 };
-    outQ[idx] += t.qty; outA[idx] += t.val;
+    outQ[idx] += t.qty; outA[idx] += convertAmt(t.val);
   }
 
   return { labels, inQ, outQ, inA, outA };
@@ -1651,7 +1711,7 @@ function buildCategData(pickings, moves, productInfo) {
     const qty   = m.product_qty || 0;
     const unit  = m.price_unit || productInfo[m.product_id[0]]?.cost || 0;
     const categ = productInfo[m.product_id[0]]?.categ || 'Sin categoría';
-    totals[categ] = (totals[categ] || 0) + qty * unit;
+    totals[categ] = (totals[categ] || 0) + convertAmt(qty * unit);
   }
   const sorted = Object.entries(totals).sort((a, b) => b[1] - a[1]);
   const top    = sorted.slice(0, 8);
@@ -1824,7 +1884,7 @@ function renderOrders(source) {
       <td><span class="type-pill type-${o.type.toLowerCase()}">${o.type}</span></td>
       <td class="product-cell">${o.product}</td>
       <td style="text-align:right">${o.qty.toLocaleString('es')}</td>
-      <td style="text-align:right">$ ${o.val.toLocaleString('es')}</td>
+      <td style="text-align:right">${fmt(o.val)}</td>
       <td><span class="${o.status==='done'?'st-done':o.status==='confirmed'?'st-conf':'st-draft'}">
         ${o.status==='done'?'Hecho':o.status==='confirmed'?'Confirmado':'Borrador'}
       </span></td>
