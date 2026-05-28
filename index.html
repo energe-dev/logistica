@@ -249,6 +249,49 @@
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: var(--off-white); }
 
+    tr.expandable-row { cursor: pointer; }
+    tr.expandable-row td { background: inherit; }
+    tr.detail-row td {
+      padding: 0;
+      border-bottom: none;
+      background: #fafafa;
+    }
+    tr.detail-row .detail-inner {
+      overflow: hidden;
+      max-height: 0;
+      transition: max-height 0.22s ease;
+    }
+    tr.detail-row.open .detail-inner {
+      max-height: 600px;
+    }
+    .detail-table {
+      width: 100%;
+      border-collapse: collapse;
+      border-top: 1px solid var(--border);
+      border-bottom: 2px solid var(--orange);
+    }
+    .detail-table td {
+      padding: 7px 8px 7px 32px;
+      font-size: 12px;
+      color: var(--text-soft);
+      border-bottom: 1px solid #eee;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .detail-table tr:last-child td { border-bottom: none; }
+    .detail-table td.dt-product { color: var(--text); padding-left: 40px; }
+    .detail-table td.dt-num { text-align: right; }
+    .chevron {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      margin-right: 4px;
+      vertical-align: middle;
+      transition: transform 0.2s ease;
+      opacity: 0.45;
+      flex-shrink: 0;
+    }
+    tr.open .chevron { transform: rotate(90deg); opacity: 0.7; }
+
     .type-pill { font-size: 9px; padding: 2px 8px; border-radius: var(--radius-sm); font-weight: 700; letter-spacing: .5px; }
     .type-in   { background: var(--in-bg);  color: #085041; }
     .type-out  { background: var(--out-bg); color: #7A3B0A; }
@@ -1462,13 +1505,18 @@ function buildWarehouseOrders(inPickings, outPickings, moves, productInfo) {
       ref:     p.name,
       type:    isIn ? 'IN' : 'OUT',
       product: pMoves.length > 1
-        ? `${pMoves[0]?.product_id[1] || '—'} <span style="color:#888;font-size:10px">(+${pMoves.length - 1} más)</span>`
+        ? `${pMoves[0]?.product_id[1] || '—'}`
         : (pMoves[0]?.product_id[1] || '—'),
       qty:     Math.round(qty),
       val:     Math.round(val),
       status:  p.state === 'done' ? 'done' : p.state === 'assigned' ? 'confirmed' : 'draft',
       date:    p.scheduled_date ? p.scheduled_date.slice(0,10) : '—',
       user:    Array.isArray(p.user_id) ? p.user_id[1] : p.user_id || '—',
+      lines:   pMoves.length > 1 ? pMoves.map(m => ({
+        name:  m.product_id[1] || '—',
+        qty:   Math.round(m.product_qty || 0),
+        val:   Math.round((m.product_qty || 0) * (m.price_unit || productInfo[m.product_id[0]]?.cost || 0)),
+      })) : null,
     };
   });
 }
@@ -1880,18 +1928,63 @@ function applyFilter() {
 
 function renderOrders(source) {
   const rows = source || DEMO_ORDERS;
-  document.getElementById('orders-body').innerHTML = rows.map(o => `
-    <tr>
+  const tbody = document.getElementById('orders-body');
+
+  const html = rows.map((o, i) => {
+    const hasLines = o.lines && o.lines.length > 0;
+    const statusSpan = `<span class="${o.status==='done'?'st-done':o.status==='confirmed'?'st-conf':'st-draft'}">${o.status==='done'?'Hecho':o.status==='confirmed'?'Confirmado':'Borrador'}</span>`;
+    const chevron = hasLines
+      ? `<svg class="chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="5,3 11,8 5,13"/></svg>`
+      : '';
+    const productCell = hasLines
+      ? `${chevron}${o.product} <span style="color:#aaa;font-size:10px;font-weight:600">(${o.lines.length} ítems)</span>`
+      : o.product;
+
+    const mainRow = `<tr class="${hasLines ? 'expandable-row' : ''}" data-idx="${i}">
       <td style="font-family:monospace;font-size:11px;color:#888">${o.ref}</td>
       <td><span class="type-pill type-${o.type.toLowerCase()}">${o.type}</span></td>
-      <td class="product-cell">${o.product}</td>
+      <td class="product-cell">${productCell}</td>
       <td style="text-align:right">${o.qty.toLocaleString('es')}</td>
       <td style="text-align:right">${fmt(o.val)}</td>
-      <td><span class="${o.status==='done'?'st-done':o.status==='confirmed'?'st-conf':'st-draft'}">
-        ${o.status==='done'?'Hecho':o.status==='confirmed'?'Confirmado':'Borrador'}
-      </span></td>
+      <td>${statusSpan}</td>
       <td style="color:#888">${o.date}</td>
-    </tr>`).join('');
+    </tr>`;
+
+    if (!hasLines) return mainRow;
+
+    const lineHtml = o.lines.map(l => `
+      <tr>
+        <td class="dt-product">${l.name}</td>
+        <td class="dt-num">${l.qty.toLocaleString('es')} u.</td>
+        <td class="dt-num">${fmt(l.val)}</td>
+        <td></td><td></td><td></td>
+      </tr>`).join('');
+
+    const detailRow = `<tr class="detail-row" data-detail="${i}">
+      <td colspan="7">
+        <div class="detail-inner">
+          <table class="detail-table">
+            <tbody>${lineHtml}</tbody>
+          </table>
+        </div>
+      </td>
+    </tr>`;
+
+    return mainRow + detailRow;
+  }).join('');
+
+  tbody.innerHTML = html;
+
+  tbody.querySelectorAll('tr.expandable-row').forEach(tr => {
+    tr.addEventListener('click', () => {
+      const idx = tr.dataset.idx;
+      const detail = tbody.querySelector(`tr.detail-row[data-detail="${idx}"]`);
+      if (!detail) return;
+      const isOpen = detail.classList.contains('open');
+      detail.classList.toggle('open', !isOpen);
+      tr.classList.toggle('open', !isOpen);
+    });
+  });
 }
 
 /* ================================================================
