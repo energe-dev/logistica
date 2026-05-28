@@ -1461,7 +1461,9 @@ function buildWarehouseOrders(inPickings, outPickings, moves, productInfo) {
     return {
       ref:     p.name,
       type:    isIn ? 'IN' : 'OUT',
-      product: pMoves[0]?.product_id[1] || '—',
+      product: pMoves.length > 1
+        ? `${pMoves[0]?.product_id[1] || '—'} <span style="color:#888;font-size:10px">(+${pMoves.length - 1} más)</span>`
+        : (pMoves[0]?.product_id[1] || '—'),
       qty:     Math.round(qty),
       val:     Math.round(val),
       status:  p.state === 'done' ? 'done' : p.state === 'assigned' ? 'confirmed' : 'draft',
